@@ -101,6 +101,18 @@ TEST_CASE("DataBlock - Basic Functionality", "[DataBlock]")
     REQUIRE(newBlock.data == block.data);
     REQUIRE(newBlock.shape == block.shape);
   }
+
+  SECTION("From Generic converts numeric values")
+  {
+    const DataBlockGeneric genericBlock(std::vector<double> {0.1, 0.25},
+                                        SizeArray {2},
+                                        typeid(double),
+                                        BaseDataType::F64);
+    const auto converted = DataBlock<float>::fromGeneric(genericBlock);
+
+    REQUIRE(converted.data == (std::vector<float> {0.1f, 0.25f}));
+    REQUIRE(converted.shape == SizeArray {2});
+  }
 }
 
 TEST_CASE("DataBlockGeneric - Basic Functionality", "[DataBlockGeneric]")

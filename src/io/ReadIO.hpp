@@ -342,19 +342,56 @@ public:
   /**
    * @brief Factory method to create an DataBlock from a DataBlockGeneric.
    *
-   * The function using std::any_cast to avoid copying the data
+   * When the values stored in the file are of a different numeric type than
+   * DTYPE, they are converted element-wise. This happens whenever a dataset is
+   * stored at a different precision than the accessor declares, which the NWB
+   * schema permits: a schema `float` column, for example, may legally be
+   * stored as float64. Reading such a column through its schema-typed accessor
+   * would otherwise throw std::bad_any_cast. Note that the conversion can lose
+   * precision -- read through a wider DTYPE to get the stored values exactly.
    *
    * @param genericData The DataBlockGeneric structure containing the data and
    * shape.
    *
    * @return A DataBlock structure containing the data and shape.
+   * @throws std::bad_any_cast if the stored values cannot be converted to
+   * DTYPE.
    */
   inline static DataBlock<DTYPE> fromGeneric(
       const DataBlockGeneric& genericData)
   {
-    auto result = DataBlock<DTYPE>(
-        std::any_cast<std::vector<DTYPE>>(genericData.data), genericData.shape);
-    return result;
+    if (const auto* exact =
+            std::any_cast<std::vector<DTYPE>>(&genericData.data))
+    {
+      return DataBlock<DTYPE>(*exact, genericData.shape);
+    }
+
+    if constexpr (std::is_arithmetic_v<DTYPE>) {
+      std::vector<DTYPE> converted;
+      const auto convertFrom = [&](auto storedTypeTag)
+      {
+        using Stored = decltype(storedTypeTag);
+        const auto* values =
+            std::any_cast<std::vector<Stored>>(&genericData.data);
+        if (values == nullptr) {
+          return false;
+        }
+        // Implicit narrowing (e.g. float64 -> float32) is intentional here.
+        converted.assign(values->begin(), values->end());
+        return true;
+      };
+      const bool didConvert = convertFrom(uint8_t {})
+          || convertFrom(uint16_t {}) || convertFrom(uint32_t {})
+          || convertFrom(uint64_t {}) || convertFrom(int8_t {})
+          || convertFrom(int16_t {}) || convertFrom(int32_t {})
+          || convertFrom(int64_t {}) || convertFrom(float {})
+          || convertFrom(double {});
+      if (didConvert) {
+        return DataBlock<DTYPE>(converted, genericData.shape);
+      }
+    }
+
+    throw std::bad_any_cast();
   }
 
   /**

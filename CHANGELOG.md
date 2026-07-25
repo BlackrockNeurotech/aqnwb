@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Fixed Windows CI by updating the CMake generator in `CMakePresets.json` from `"Visual Studio 17 2022"` to `"Visual Studio 18 2026"` to match the updated `windows-latest` runner (@copilot, @oruebel [#319](https://github.com/NeurodataWithoutBorders/aqnwb/pull/319))
 * Fixed `HDF5IO::createStringDataSet(const std::string&, const std::vector<std::string>&)` to write all values instead of only the first element and to return the status of the write. (@cboulay)
 * Fixed `HDF5IO::createReferenceDataSet` leaking the HDF5 dataspace and dataset handles on error paths, and over-allocating the reference buffer by a factor of `sizeof(hobj_ref_t)`. (@chittti)
+* Fixed `DataBlock::fromGeneric` throwing `std::bad_any_cast` when a dataset is stored at a different numeric precision than the accessor declares. The NWB schema permits this — a schema `float` column such as `TimestampVectorData` may legally be stored as `float64` — so reading one through its schema-typed accessor (`EventsTable::readTimestampColumn()->readData()`) aborted. Mismatched numeric types are now converted element-wise; read through a wider type to get the stored values exactly. (@chittti)
 
 ## [0.3.0] - 2026-02-23
 
