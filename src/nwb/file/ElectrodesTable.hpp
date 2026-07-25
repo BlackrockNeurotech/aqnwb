@@ -115,6 +115,16 @@ public:
       "group_name",
       "the name of the ElectrodeGroup this electrode is a part of")
 
+protected:
+  /**
+   * @brief Append string-column batches at the dataset's current extent.
+   *
+   * Electrode metadata can arrive in multiple device batches, so these columns
+   * must extend rather than overwrite prior rows.
+   */
+  SizeArray columnWriteOffset(
+      const std::shared_ptr<IO::BaseRecordingData>& dataset) const override;
+
 private:
   /**
    * @brief The global indices for each added electrode.

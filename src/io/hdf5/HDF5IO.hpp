@@ -230,6 +230,11 @@ public:
       const std::string& path,
       const std::vector<std::string>& references) override;
 
+  /** @copydoc BaseIO::appendReferenceDataSet */
+  Status appendReferenceDataSet(
+      const std::string& path,
+      const std::vector<std::string>& references) override;
+
   /**
    * @brief Start SWMR write to start recording process.
    * @return The status of the start recording operation.

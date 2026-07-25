@@ -189,7 +189,8 @@ TEST_CASE("DynamicTable", "[table]")
     }
   }
 
-  SECTION("test setColNames rejects non-permutations")
+  SECTION(
+      "test setColNames allows additions but rejects removals and duplicates")
   {
     std::string path = getTestFilePath("testDynamicTableInvalidColNames.h5");
     std::shared_ptr<BaseIO> io = createIO("HDF5", path);
@@ -210,12 +211,36 @@ TEST_CASE("DynamicTable", "[table]")
     auto initialColNames = table->readColNames()->values().data;
     REQUIRE(initialColNames == std::vector<std::string>({"col1", "col2"}));
 
+    const std::vector<std::string> extendedColNames = {
+        "col2", "col1", "future_col"};
+    table->setColNames(extendedColNames);
+    REQUIRE(table->readColNames()->values().data == extendedColNames);
+
+    // Pre-registering a future column name must not make the generic table
+    // append past a newly preallocated dataset instead of filling it.
+    IO::ArrayDataSetConfig preallocatedConfig(
+        BaseDataType::V_STR, SizeArray {2}, SizeArray {2});
+    auto futureCol =
+        NWB::VectorData::create(mergePaths(tablePath, "future_col"), io);
+    REQUIRE(futureCol->initialize(preallocatedConfig, "Future column")
+            == Status::Success);
+    REQUIRE(table->addColumn(futureCol,
+                             std::vector<std::string> {"future1", "future2"})
+            == Status::Success);
+    auto futureData = DataBlock<std::string>::fromGeneric(
+        futureCol->readData()->valuesGeneric());
+    REQUIRE(futureData.data
+            == std::vector<std::string>({"future1", "future2"}));
+
     REQUIRE_THROWS_AS(table->setColNames({"col1"}), std::invalid_argument);
     REQUIRE_THROWS_AS(table->setColNames({"col1", "col3"}),
                       std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        table->setColNames({"col1", "col2", "future_col", "future_col"}),
+        std::invalid_argument);
 
     auto unchangedColNames = table->readColNames()->values().data;
-    REQUIRE(unchangedColNames == initialColNames);
+    REQUIRE(unchangedColNames == extendedColNames);
 
     io->close();
   }
@@ -512,26 +537,33 @@ TEST_CASE("DynamicTable", "[table]")
     io->open();
     auto readTable = NWB::DynamicTable::create(tablePath, io);
 
+    // Append after recreating the wrapper. Implicit IDs must continue from
+    // the existing id dataset instead of restarting at zero.
+    NWB::DynamicTable::RowData row4 = {{"col_str", std::string("row4")},
+                                       {"col_f32", 4.5f}};
+    REQUIRE(readTable->addRow(row4) == Status::Success);
+
     auto readColNames = readTable->readColNames()->values().data;
     REQUIRE(readColNames == std::vector<std::string>({"col_str", "col_f32"}));
 
     auto readIds = readTable->readIdColumn()->readData()->values().data;
-    REQUIRE(readIds == std::vector<int>({0, 1, 2}));
+    REQUIRE(readIds == std::vector<int>({0, 1, 2, 3}));
 
     auto colStr = readTable->readColumn<NWB::VectorData>("col_str");
     auto colStrDataGeneric = colStr->readData()->valuesGeneric();
     auto colStrDataTyped =
         DataBlock<std::string>::fromGeneric(colStrDataGeneric);
     auto colStrData = colStrDataTyped.data;
-    REQUIRE(colStrData.size() == 3);
-    REQUIRE(colStrData == std::vector<std::string>({"row1", "row2", "row3"}));
+    REQUIRE(colStrData.size() == 4);
+    REQUIRE(colStrData
+            == std::vector<std::string>({"row1", "row2", "row3", "row4"}));
 
     auto colF32 = readTable->readColumn<NWB::VectorData>("col_f32");
     auto colF32DataGeneric = colF32->readData()->valuesGeneric();
     auto colF32DataTyped = DataBlock<float>::fromGeneric(colF32DataGeneric);
     auto colF32Data = colF32DataTyped.data;
-    REQUIRE(colF32Data.size() == 3);
-    REQUIRE(colF32Data == std::vector<float>({1.5f, 2.5f, 3.5f}));
+    REQUIRE(colF32Data.size() == 4);
+    REQUIRE(colF32Data == std::vector<float>({1.5f, 2.5f, 3.5f, 4.5f}));
 
     io->close();
   }
@@ -552,7 +584,6 @@ TEST_CASE("DynamicTable", "[table]")
 
     // Add a string column using addColumn(vectorData, values)
     std::vector<std::string> initialValues = {"a", "b", "c"};
-    SizeArray dataShape = {initialValues.size()};
     SizeArray chunking = {10};  // chunked to allow append
     IO::ArrayDataSetConfig config(BaseDataType::V_STR, SizeArray {0}, chunking);
     auto col1 = NWB::VectorData::create(mergePaths(tablePath, "col1"), io);

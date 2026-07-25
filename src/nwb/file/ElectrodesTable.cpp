@@ -30,6 +30,16 @@ ElectrodesTable::ElectrodesTable(const std::string& path,
 /** Destructor */
 ElectrodesTable::~ElectrodesTable() {}
 
+SizeArray ElectrodesTable::columnWriteOffset(
+    const std::shared_ptr<IO::BaseRecordingData>& dataset) const
+{
+  if (!dataset) {
+    return SizeArray {0};
+  }
+  const SizeArray& currentShape = dataset->getShape();
+  return SizeArray {currentShape.empty() ? 0 : currentShape[0]};
+}
+
 std::vector<DynamicTable::DataSpecPtr> ElectrodesTable::createDefaultDataSpecs(
     const SizeType rowChunkSize)
 {
@@ -50,14 +60,8 @@ std::vector<DynamicTable::DataSpecPtr> ElectrodesTable::createDefaultDataSpecs(
       groupNameConfig,
       "the name of the ElectrodeGroup this electrode is a part of"));
 
-  // Note: "group" is a reference column, which is currently added dynamically
-  // in finalize() We don't add it to the specs here because reference columns
-  // are not yet supported in DataSpec. Also, reference columns can currently
-  // not be configured with chunking to support resize/append.
-  // TODO: Add support for reference columns in DataSpec and configure them
-  // here.
-  // TODO: Add support for creating reference columns with chunking to support
-  // resize/append.
+  // "group" is added in finalize() because DataSpec does not support
+  // reference columns.
 
   return specs;
 }
@@ -68,26 +72,18 @@ Status ElectrodesTable::validateDataSpecs(
   return checkRequiredColumnNames({"id", "location", "group_name"}, dataSpecs);
 }
 
-/** Initialization function*/
 Status ElectrodesTable::initialize(const std::string& description,
                                    const std::vector<DataSpecPtr>& columnSpecs)
 {
-  std::vector<DataSpecPtr> specsToUse = columnSpecs;
-  if (specsToUse.empty()) {
-    specsToUse = createDefaultDataSpecs();
-  }
-
-  // create group. This configures the "location" and "group_name" columns
-  // (among others) via the DataSpec mechanism, creating and registering the
-  // corresponding VectorData recording objects exactly once.
-  Status dtStatus = DynamicTable::initialize(description, specsToUse);
-
-  return dtStatus;
+  // Configure and register each DataSpec-backed column exactly once.
+  const auto specs =
+      columnSpecs.empty() ? createDefaultDataSpecs() : columnSpecs;
+  return DynamicTable::initialize(description, specs);
 }
 
 void ElectrodesTable::addElectrodes(const std::vector<Channel>& channelsInput)
 {
-  // create datasets
+  // Buffer electrode metadata until finalize().
   for (const auto& ch : channelsInput) {
     m_groupReferences.push_back(
         AQNWB::mergePaths(m_groupPathBase, ch.getGroupName()));
@@ -100,66 +96,42 @@ void ElectrodesTable::addElectrodes(const std::vector<Channel>& channelsInput)
 Status ElectrodesTable::finalize()
 {
   Status status = Status::Success;
-  // Check if new values have been added for the columns and update them
-  // Updated electrode numbers
-  if (m_electrodeNumbers.size() > 0) {
-    Status rowIdStatus = setRowIDs(m_electrodeNumbers);
-    m_electrodeNumbers.clear();  // clear after writing
-    status = status && rowIdStatus;
+  // Append identifiers for newly added electrodes.
+  if (!m_electrodeNumbers.empty()) {
+    status = status && setRowIDs(m_electrodeNumbers);
+    m_electrodeNumbers.clear();
   }
-  // Add the location names
-  if (m_locationNames.size() > 0) {
-    auto locationColumn = getConfiguredColumn("location");
-    if (!locationColumn) {
-      std::cerr << "ElectrodesTable::finalize failed to get location column."
-                << std::endl;
-      status = Status::Failure;
-    } else {
-      // Write all strings in a single block
-      auto dataset = locationColumn->recordData();
-      Status writeStatus =
-          dataset->writeDataBlock(SizeArray {m_locationNames.size()},
-                                  SizeArray {0},
-                                  IO::BaseDataType::V_STR,
-                                  m_locationNames);
 
-      m_locationNames.clear();  // clear after writing
-      status = status && writeStatus;
+  // Append string metadata at each column's current extent.
+  const auto appendStrings =
+      [this, &status](const std::string& name, std::vector<std::string>& values)
+  {
+    if (!values.empty()) {
+      auto column = getConfiguredColumn(name);
+      if (!column || !column->recordData()) {
+        std::cerr << "ElectrodesTable::finalize failed to get " << name
+                  << " column." << std::endl;
+        status = Status::Failure;
+        return;
+      }
+      status = status && addColumn(column, values);
+      values.clear();
     }
-  }
-  // Add the group names
-  if (m_groupNames.size() > 0) {
-    auto groupNameColumn = getConfiguredColumn("group_name");
-    if (!groupNameColumn) {
-      std::cerr << "ElectrodesTable::finalize failed to get group_name column."
-                << std::endl;
-      status = Status::Failure;
-    } else {
-      // Write all strings in a single block
-      auto dataset = groupNameColumn->recordData();
-      Status writeStatus =
-          dataset->writeDataBlock(SizeArray {m_groupNames.size()},
-                                  SizeArray {0},
-                                  IO::BaseDataType::V_STR,
-                                  m_groupNames);
-      m_groupNames.clear();  // clear after writing
-      status = status && writeStatus;
-    }
-  }
-  // Add the group references
-  if (m_groupReferences.size() > 0) {
-    // create the references to the ElectrodeGroup objects
-    Status groupColStatus = addReferenceColumn(
-        "group",
-        "a reference to the ElectrodeGroup this electrode is a part of",
-        m_groupReferences);
-    status = status && groupColStatus;
-    m_groupReferences.clear();  // clear after writing
-  }
-  // finalize the parent class to write the col names
-  // This must be done after all columns have been added
-  Status dtStatus = DynamicTable::finalize();
-  status = status && dtStatus;
+  };
+  appendStrings("location", m_locationNames);
+  appendStrings("group_name", m_groupNames);
 
-  return status;
+  // Create or extend references to the owning ElectrodeGroup objects.
+  if (!m_groupReferences.empty()) {
+    status =
+        status
+        && addReferenceColumn(
+            "group",
+            "a reference to the ElectrodeGroup this electrode is a part of",
+            m_groupReferences);
+    m_groupReferences.clear();
+  }
+
+  // Flush column names after all dynamic columns have been registered.
+  return status && DynamicTable::finalize();
 }

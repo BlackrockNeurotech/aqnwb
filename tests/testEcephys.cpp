@@ -13,6 +13,7 @@
 #include "nwb/RegisteredType.hpp"
 #include "nwb/device/Device.hpp"
 #include "nwb/ecephys/ElectricalSeries.hpp"
+#include "nwb/ecephys/FeatureExtraction.hpp"
 #include "nwb/ecephys/SpikeEventSeries.hpp"
 #include "nwb/file/ElectrodeGroup.hpp"
 #include "nwb/file/ElectrodesTable.hpp"
@@ -27,6 +28,7 @@ TEST_CASE("registered ecephys types", "[ecephys]")
   REQUIRE(registry.find("core::ElectrodeGroup") != registry.end());
   REQUIRE(registry.find("core::ElectrodesTable") != registry.end());
   REQUIRE(registry.find("core::ElectricalSeries") != registry.end());
+  REQUIRE(registry.find("core::FeatureExtraction") != registry.end());
   REQUIRE(registry.find("core::SpikeEventSeries") != registry.end());
 }
 
@@ -469,6 +471,230 @@ TEST_CASE("ElectricalSeries", "[ecephys]")
             readElectrodesTable5);
     REQUIRE(readElectrodesTable5_cast != nullptr);
   }
+}
+
+TEST_CASE("ElectrodesTable append", "[ecephys][table]")
+{
+  const std::string path = getTestFilePath("ElectrodesTableAppend.h5");
+  auto io = createIO("HDF5", path);
+  REQUIRE(io->open() == Status::Success);
+  REQUIRE(io->createGroup("/general") == Status::Success);
+  REQUIRE(io->createGroup("/general/extracellular_ephys") == Status::Success);
+
+  const auto mockArrays = getMockChannelArrays(2, 2);
+  auto device = NWB::Device::create("/device", io);
+  REQUIRE(device->initialize("description", "unknown") == Status::Success);
+  for (const auto& channels : mockArrays) {
+    const std::string groupPath =
+        "/general/extracellular_ephys/" + channels.front().getGroupName();
+    auto electrodeGroup = NWB::ElectrodeGroup::create(groupPath, io);
+    REQUIRE(electrodeGroup->initialize("description", "unknown", device)
+            == Status::Success);
+  }
+
+  auto electrodesTable = NWB::ElectrodesTable::create(io);
+  REQUIRE(electrodesTable->initialize("description") == Status::Success);
+  auto colNames = electrodesTable->readColNames()->values().data;
+  colNames.push_back("label");
+  electrodesTable->setColNames(colNames);
+  const std::string labelPath =
+      NWB::ElectrodesTable::electrodesTablePath + "/label";
+  auto labelColumn = NWB::VectorData::create(labelPath, io);
+  IO::ArrayDataSetConfig labelConfig(
+      BaseDataType::V_STR, SizeArray {0}, SizeArray {2});
+  REQUIRE(labelColumn->initialize(labelConfig, "electrode label")
+          == Status::Success);
+  REQUIRE(electrodesTable->addColumn(
+              labelColumn, std::vector<std::string> {"label0", "label1"})
+          == Status::Success);
+  electrodesTable->addElectrodes(mockArrays[0]);
+  REQUIRE(electrodesTable->finalize() == Status::Success);
+
+  // A fresh wrapper around the existing table matches Orion's deferred-device
+  // path: initialize is intentionally not called again.
+  auto reopenedTable = NWB::ElectrodesTable::create(io);
+  auto reopenedLabelColumn = NWB::VectorData::create(labelPath, io);
+  REQUIRE(
+      reopenedTable->addColumn(reopenedLabelColumn,
+                               std::vector<std::string> {"label2", "label3"})
+      == Status::Success);
+  reopenedTable->addElectrodes(mockArrays[1]);
+  REQUIRE(reopenedTable->finalize() == Status::Success);
+
+  const std::vector<int> expectedIds = {0, 1, 2, 3};
+  REQUIRE(reopenedTable->readIdColumn()->readData()->values().data
+          == expectedIds);
+  REQUIRE(reopenedTable->readLocationColumn()->readData()->values().data
+          == std::vector<std::string>(
+              {"unknown", "unknown", "unknown", "unknown"}));
+  REQUIRE(
+      reopenedTable->readGroupNameColumn()->readData()->values().data
+      == std::vector<std::string>({"array0", "array0", "array1", "array1"}));
+  REQUIRE(
+      reopenedTable->readColumn<std::string>("label")->readData()->values().data
+      == std::vector<std::string>({"label0", "label1", "label2", "label3"}));
+  REQUIRE(io->getStorageObjectShape(NWB::ElectrodesTable::electrodesTablePath
+                                    + "/group")
+          == SizeArray {4});
+  REQUIRE_FALSE(io->getStorageObjectChunking(
+                      NWB::ElectrodesTable::electrodesTablePath + "/group")
+                    .empty());
+
+  io->close();
+
+  H5::H5File file(path, H5F_ACC_RDONLY);
+  H5::DataSet groupDataset =
+      file.openDataSet(NWB::ElectrodesTable::electrodesTablePath + "/group");
+  std::vector<hobj_ref_t> groupReferences(expectedIds.size());
+  groupDataset.read(groupReferences.data(), H5::PredType::STD_REF_OBJ);
+  const std::vector<std::string> expectedGroupPaths = {
+      "/general/extracellular_ephys/array0",
+      "/general/extracellular_ephys/array0",
+      "/general/extracellular_ephys/array1",
+      "/general/extracellular_ephys/array1"};
+  for (SizeType i = 0; i < groupReferences.size(); ++i) {
+    const hid_t groupId = H5Rdereference2(
+        file.getId(), H5P_DEFAULT, H5R_OBJECT, &groupReferences[i]);
+    REQUIRE(groupId >= 0);
+    H5::Group group(groupId);
+    REQUIRE(group.getObjName() == expectedGroupPaths[i]);
+    H5Gclose(groupId);
+  }
+}
+
+TEST_CASE("FeatureExtraction", "[ecephys]")
+{
+  constexpr SizeType numChannels = 2;
+  constexpr SizeType numFeatures = 2;
+  const std::string path = getTestFilePath("FeatureExtraction.h5");
+  auto io = createIO("HDF5", path);
+  REQUIRE(io->open() == Status::Success);
+  REQUIRE(io->createGroup("/general") == Status::Success);
+  REQUIRE(io->createGroup("/general/extracellular_ephys") == Status::Success);
+  REQUIRE(io->createGroup("/processing") == Status::Success);
+  REQUIRE(io->createGroup("/processing/ecephys") == Status::Success);
+
+  const auto mockArrays = getMockChannelArrays(numChannels, 1);
+  auto device = NWB::Device::create("/device", io);
+  REQUIRE(device->initialize("description", "unknown") == Status::Success);
+  const std::string electrodeGroupPath =
+      "/general/extracellular_ephys/" + mockArrays[0].front().getGroupName();
+  auto electrodeGroup = NWB::ElectrodeGroup::create(electrodeGroupPath, io);
+  REQUIRE(electrodeGroup->initialize("description", "unknown", device)
+          == Status::Success);
+
+  auto electrodesTable = NWB::ElectrodesTable::create(io);
+  REQUIRE(electrodesTable->initialize("description") == Status::Success);
+  electrodesTable->addElectrodes(mockArrays[0]);
+  REQUIRE(electrodesTable->finalize() == Status::Success);
+
+  const std::string featurePath = "/processing/ecephys/features";
+  auto featureExtraction = NWB::FeatureExtraction::create(featurePath, io);
+  IO::ArrayDataSetConfig featuresConfig(BaseDataType::F32,
+                                        SizeArray {0, numChannels, numFeatures},
+                                        SizeArray {2, 0, 0});
+  IO::ArrayDataSetConfig timesConfig(
+      BaseDataType::F64, SizeArray {0}, SizeArray {2});
+  const std::vector<std::string> featureLabels = {"spk", "sbp"};
+  const std::vector<int> electrodeIndices = {0, 1};
+  REQUIRE(featureExtraction->initialize(featuresConfig,
+                                        timesConfig,
+                                        featureLabels,
+                                        electrodeIndices,
+                                        numChannels,
+                                        numFeatures)
+          == Status::Success);
+  REQUIRE(featureExtraction->numChannels() == numChannels);
+  REQUIRE(featureExtraction->numFeatures() == numFeatures);
+
+  const std::vector<float> firstFeatures = {
+      1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  const std::vector<double> firstTimes = {0.1, 0.2};
+  REQUIRE(
+      featureExtraction->writeEvents(2, firstFeatures.data(), firstTimes.data())
+      == Status::Success);
+  const std::vector<float> secondFeatures = {9.0f, 10.0f, 11.0f, 12.0f};
+  const std::vector<double> secondTimes = {0.3};
+  REQUIRE(featureExtraction->writeEvents(
+              1, secondFeatures.data(), secondTimes.data())
+          == Status::Success);
+
+  std::vector<float> expectedFeatures = firstFeatures;
+  expectedFeatures.insert(
+      expectedFeatures.end(), secondFeatures.begin(), secondFeatures.end());
+  std::vector<double> expectedTimes = firstTimes;
+  expectedTimes.insert(
+      expectedTimes.end(), secondTimes.begin(), secondTimes.end());
+  REQUIRE(featureExtraction->readFeatures()->values().data == expectedFeatures);
+  REQUIRE(featureExtraction->readTimes()->values().data == expectedTimes);
+  REQUIRE(featureExtraction->readDescriptionDataset()->values().data
+          == featureLabels);
+  REQUIRE(featureExtraction->readElectrodes()->values().data
+          == electrodeIndices);
+  REQUIRE(featureExtraction->readElectrodesTable()->getPath()
+          == NWB::ElectrodesTable::electrodesTablePath);
+  REQUIRE(io->getStorageObjectShape(featurePath + "/features")
+          == (SizeArray {3, numChannels, numFeatures}));
+
+  SECTION("initialize rejects inconsistent arguments")
+  {
+    auto badFeatures =
+        NWB::FeatureExtraction::create("/processing/ecephys/bad_features", io);
+
+    // One label per feature dimension, one electrode index per channel.
+    REQUIRE(badFeatures->initialize(featuresConfig,
+                                    timesConfig,
+                                    {"only_one_label"},
+                                    electrodeIndices,
+                                    numChannels,
+                                    numFeatures)
+            == Status::Failure);
+    REQUIRE(badFeatures->initialize(featuresConfig,
+                                    timesConfig,
+                                    featureLabels,
+                                    {0},
+                                    numChannels,
+                                    numFeatures)
+            == Status::Failure);
+
+    // features must be [0, numChannels, numFeatures] float32 and times must be
+    // [0] float64, otherwise writeEvents would compute offsets that do not
+    // match the dataset it writes into.
+    IO::ArrayDataSetConfig wrongShape(
+        BaseDataType::F32,
+        SizeArray {0, numChannels + 1, numFeatures},
+        SizeArray {2, numChannels + 1, numFeatures});
+    REQUIRE(badFeatures->initialize(wrongShape,
+                                    timesConfig,
+                                    featureLabels,
+                                    electrodeIndices,
+                                    numChannels,
+                                    numFeatures)
+            == Status::Failure);
+
+    IO::ArrayDataSetConfig wrongType(BaseDataType::F64,
+                                     SizeArray {0, numChannels, numFeatures},
+                                     SizeArray {2, numChannels, numFeatures});
+    REQUIRE(badFeatures->initialize(wrongType,
+                                    timesConfig,
+                                    featureLabels,
+                                    electrodeIndices,
+                                    numChannels,
+                                    numFeatures)
+            == Status::Failure);
+
+    IO::ArrayDataSetConfig wrongTimes(
+        BaseDataType::F32, SizeArray {0}, SizeArray {2});
+    REQUIRE(badFeatures->initialize(featuresConfig,
+                                    wrongTimes,
+                                    featureLabels,
+                                    electrodeIndices,
+                                    numChannels,
+                                    numFeatures)
+            == Status::Failure);
+  }
+
+  io->close();
 }
 
 TEST_CASE("SpikeEventSeries", "[ecephys]")

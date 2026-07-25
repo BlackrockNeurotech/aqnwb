@@ -109,10 +109,7 @@ public:
   /**
    * @brief Adds a column of vector string data to the table.
    *
-   * If the VectorData has already been added to the table, it will not be
-   * added again, but the values will still be appended to the existing dataset.
-   *
-   * @param vectorData A unique pointer to the `VectorData` dataset.
+   * @param vectorData A shared pointer to the `VectorData` dataset.
    * @param values The vector of string values.
    * @return Status::Success if successful, otherwise Status::Failure.
    */
@@ -149,6 +146,12 @@ public:
 
   /**
    * @brief Adds a column of references to the table.
+   *
+   * If the column dataset already exists in the file, the references are
+   * appended to it instead of creating a new column. Appending requires the
+   * existing dataset to be extensible (reference datasets created via
+   * BaseIO::createReferenceDataSet are chunked and extensible).
+   *
    * @param name The name of the column.
    * @param colDescription The description of the column.
    * @param dataset The vector of string values representing the references.
@@ -158,8 +161,37 @@ public:
                             const std::string& colDescription,
                             const std::vector<std::string>& dataset);
 
+  /**
+   * @brief Adds a single row of data to the table.
+   *
+   * A value must be provided for every configured column of the table.
+   *
+   * @note Row-based insertion does not support reference columns (see
+   * addReferenceColumn). Once a reference column is part of the table, rows
+   * must be written via the column-based APIs instead.
+   *
+   * @param row Map from column name to the value for that column.
+   * @param rowId Optional id for the row. If not provided, the id is
+   * auto-generated from the current number of rows.
+   * @return Status::Success if successful, otherwise Status::Failure.
+   */
   Status addRow(const RowData& row,
                 const std::optional<int>& rowId = std::nullopt);
+
+  /**
+   * @brief Adds multiple rows of data to the table.
+   *
+   * Each row must provide a value for every configured column of the table.
+   *
+   * @note Row-based insertion does not support reference columns (see
+   * addReferenceColumn). Once a reference column is part of the table, rows
+   * must be written via the column-based APIs instead.
+   *
+   * @param rows The rows to add.
+   * @param rowIds Optional ids for the rows. If provided, the size must match
+   * rows; if empty, ids are auto-generated from the current number of rows.
+   * @return Status::Success if successful, otherwise Status::Failure.
+   */
   Status addRows(const std::vector<RowData>& rows,
                  const std::vector<int>& rowIds = {});
 
@@ -177,9 +209,11 @@ public:
    * If the newColNames is identical to the existing column names,
    * then no changes will be made.
    *
-   * @exception Throws std::invalid_argument if the newColNames vector does not
-   * contain all columns of the table. I.e., the newColNames vector
-   * must be a permutation of the existing column names.
+   * Existing columns may be reordered and new column names may be appended,
+   * but existing names cannot be removed and duplicate names are rejected.
+   *
+   * @exception Throws std::invalid_argument if the newColNames vector removes
+   * an existing column or contains duplicate names.
    * @param newColNames The vector of new column names.
    */
   virtual void setColNames(const std::vector<std::string>& newColNames);
@@ -348,8 +382,7 @@ protected:
    * @return A shared pointer to the configured VectorData column, or nullptr if
    * no column with the given name has been configured.
    */
-  std::shared_ptr<VectorData> getConfiguredColumn(
-      const std::string& name) const;
+  std::shared_ptr<VectorData> getConfiguredColumn(const std::string& name);
 
   /**
    * @brief Add a column to the list of configured columns.
@@ -424,6 +457,20 @@ protected:
    * @return A vector of generated row IDs.
    */
   std::vector<int> generateRowIDs(SizeType rowCount);
+
+  /**
+   * @brief Return the offset at which addColumn() writes string values.
+   *
+   * The base implementation writes from offset zero, preserving the legacy
+   * behavior for preallocated DynamicTable columns. Subclasses that support
+   * incremental column batches may override this to append at the current
+   * dataset extent.
+   *
+   * @param dataset The recording dataset for the column.
+   * @return The position offset for the write.
+   */
+  virtual SizeArray columnWriteOffset(
+      const std::shared_ptr<IO::BaseRecordingData>& dataset) const;
 
   /**
    * @brief Names of the columns in the table.

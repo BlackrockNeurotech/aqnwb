@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <numeric>
 #include <type_traits>
+#include <unordered_set>
 
 #include "nwb/hdmf/table/DynamicTable.hpp"
 
@@ -166,18 +168,20 @@ void DynamicTable::setColNames(const std::vector<std::string>& newColNames)
     return;
   }
 
-  // Ensure that the new column names are a permutation of the existing column
-  // names. This check ensures that all existing columns are present in the new
-  // list, but allows for reordering.
-  if (newColNames.size() != m_colNames.size()
-      || !std::is_permutation(
-          newColNames.begin(), newColNames.end(), m_colNames.begin()))
-  {
-    std::cerr << "New column names do not match existing column names. "
-              << "All columns must be present in the newColNames vector."
+  const std::unordered_set<std::string> uniqueNames(newColNames.begin(),
+                                                    newColNames.end());
+  const bool hasDuplicates = uniqueNames.size() != newColNames.size();
+  const bool removesExistingColumn =
+      std::any_of(m_colNames.begin(),
+                  m_colNames.end(),
+                  [&uniqueNames](const std::string& name)
+                  { return uniqueNames.find(name) == uniqueNames.end(); });
+  if (hasDuplicates || removesExistingColumn) {
+    std::cerr << "New column names must be unique and retain every existing "
+                 "column name."
               << std::endl;
     throw std::invalid_argument(
-        "New column names do not match existing column names.");
+        "New column names must be unique and retain existing columns.");
   }
 
   m_colNames = newColNames;
@@ -198,6 +202,12 @@ SizeType DynamicTable::addColumnName(const std::string& colName)
   }
 }
 
+SizeArray DynamicTable::columnWriteOffset(
+    const std::shared_ptr<IO::BaseRecordingData>& /*dataset*/) const
+{
+  return SizeArray {0};
+}
+
 Status DynamicTable::addColumn(const DataSpecPtr& dataSpec)
 {
   if (!dataSpec) {
@@ -211,24 +221,26 @@ Status DynamicTable::addColumn(const DataSpecPtr& dataSpec)
 Status DynamicTable::addColumn(const std::shared_ptr<VectorData>& vectorData,
                                const std::vector<std::string>& values)
 {
+  if (!vectorData) {
+    std::cerr << "VectorData column is null" << std::endl;
+    return Status::Failure;
+  }
   if (!vectorData->isInitialized()) {
     std::cerr << "VectorData dataset is not initialized "
               << vectorData->getPath() << std::endl;
     return Status::Failure;
-  } else {
-    // Write all strings in a single block
-    auto dataset = vectorData->recordData();
-    Status writeStatus = dataset->writeDataBlock(SizeArray {values.size()},
-                                                 SizeArray {0},
-                                                 IO::BaseDataType::V_STR,
-                                                 values);
-    addColumnName(vectorData->getName());
-    // If the column is not already in the list of configured columns, add it
-    if (m_colNames.size() > m_configuredColumns.size()) {
-      addConfiguredColumn(vectorData);
-    }
-    return writeStatus;
   }
+  auto dataset = vectorData->recordData();
+  if (!dataset) {
+    return Status::Failure;
+  }
+  Status writeStatus = dataset->writeDataBlock(SizeArray {values.size()},
+                                               columnWriteOffset(dataset),
+                                               IO::BaseDataType::V_STR,
+                                               values);
+  addColumnName(vectorData->getName());
+  addConfiguredColumn(vectorData);
+  return writeStatus;
 }
 
 Status DynamicTable::addColumn(const std::shared_ptr<VectorData>& vectorData)
@@ -241,44 +253,36 @@ Status DynamicTable::addColumn(const std::shared_ptr<VectorData>& vectorData)
     std::cerr << "VectorData dataset is not initialized "
               << vectorData->getPath() << std::endl;
     return Status::Failure;
-  } else {
-    addColumnName(vectorData->getName());
-    // If the column is not already in the list of configured columns, add it
-    if (m_colNames.size() > m_configuredColumns.size()) {
-      addConfiguredColumn(vectorData);
-    }
-    return Status::Success;
   }
+  addColumnName(vectorData->getName());
+  addConfiguredColumn(vectorData);
+  return Status::Success;
 }
 
 Status DynamicTable::setRowIDs(const std::vector<int>& values)
 {
+  if (values.empty()) {
+    return Status::Success;
+  }
+
+  if (!m_rowElementIdentifiers) {
+    m_rowElementIdentifiers = readIdColumn();
+  }
   if (!m_rowElementIdentifiers) {
     std::cerr << "ElementIdentifiers dataset is not initialized" << std::endl;
     return Status::Failure;
-  } else {
-    auto ioPtr = getIO();
-    if (!ioPtr) {
-      std::cerr << "DynamicTable::setRowIDs IO object has been deleted."
-                << std::endl;
-      return Status::Failure;
-    }
-
-    if (values.empty()) {
-      return Status::Success;
-    }
-    auto idData = m_rowElementIdentifiers->recordData();
-    SizeArray positionOffset = {0};
-    auto currentShape = idData->getShape();
-    if (!currentShape.empty()) {
-      positionOffset[0] = currentShape[0];
-    }
-    Status writeDataStatus = idData->writeDataBlock(SizeArray {values.size()},
-                                                    positionOffset,
-                                                    IO::BaseDataType::I32,
-                                                    &values[0]);
-    return writeDataStatus;
   }
+
+  auto idData = m_rowElementIdentifiers->recordData();
+  if (!idData) {
+    return Status::Failure;
+  }
+  const auto& currentShape = idData->getShape();
+  const SizeArray positionOffset = {currentShape.empty() ? 0 : currentShape[0]};
+  return idData->writeDataBlock(SizeArray {values.size()},
+                                positionOffset,
+                                IO::BaseDataType::I32,
+                                values.data());
 }
 
 Status DynamicTable::addRow(const RowData& row, const std::optional<int>& rowId)
@@ -361,36 +365,39 @@ Status DynamicTable::addReferenceColumn(const std::string& name,
                                         const std::string& colDescription,
                                         const std::vector<std::string>& dataset)
 {
-  // TODO: Similar to addColumn() we should check if the column already exists
-  // and if so append to it rather than creating a new column. This currently
-  // prevents append to work for ElectrodesTable.
   if (dataset.empty()) {
     std::cerr << "Data to add to column is empty" << std::endl;
     return Status::Failure;
-  } else {
-    auto ioPtr = getIO();
-    if (!ioPtr) {
-      std::cerr
-          << "DynamicTable::addReferenceColumn IO object has been deleted."
-          << std::endl;
+  }
+
+  auto ioPtr = getIO();
+  if (!ioPtr) {
+    std::cerr << "DynamicTable::addReferenceColumn IO object has been deleted."
+              << std::endl;
+    return Status::Failure;
+  }
+
+  const std::string columnPath = AQNWB::mergePaths(m_path, name);
+  std::shared_ptr<VectorData> refColumn;
+  if (ioPtr->objectExists(columnPath)) {
+    if (ioPtr->appendReferenceDataSet(columnPath, dataset) != Status::Success) {
+      std::cerr << "Failed to append to reference column " << columnPath
+                << std::endl;
       return Status::Failure;
     }
-
-    std::string columnPath = AQNWB::mergePaths(m_path, name);
-
-    auto refColumn = AQNWB::NWB::VectorData::createReferenceVectorData(
+    refColumn = VectorData::create(columnPath, ioPtr);
+  } else {
+    refColumn = VectorData::createReferenceVectorData(
         columnPath, ioPtr, colDescription, dataset);
-    if (refColumn == nullptr) {
+    if (!refColumn) {
       std::cerr << "Failed to create reference column" << std::endl;
       return Status::Failure;
     }
-    addColumnName(name);
-    // If the column is not already in the list of configured columns, add it
-    if (m_colNames.size() > m_configuredColumns.size()) {
-      addConfiguredColumn(refColumn);
-    }
-    return Status::Success;
   }
+
+  addColumnName(name);
+  addConfiguredColumn(refColumn);
+  return Status::Success;
 }
 
 Status DynamicTable::flushColNames()
@@ -511,9 +518,15 @@ std::shared_ptr<MeaningsTable> DynamicTable::createMeaningsTableInstance(
 }
 
 std::shared_ptr<VectorData> DynamicTable::getConfiguredColumn(
-    const std::string& name) const
+    const std::string& name)
 {
   auto it = m_configuredColumnIndices.find(name);
+  if (it == m_configuredColumnIndices.end()) {
+    if (loadConfiguredColumnsFromFile() != Status::Success) {
+      return nullptr;
+    }
+    it = m_configuredColumnIndices.find(name);
+  }
   if (it != m_configuredColumnIndices.end()) {
     return m_configuredColumns[it->second].column;
   }
@@ -567,15 +580,10 @@ Status DynamicTable::configureDataObject(const DataSpec& dataSpec)
     return Status::Failure;
   }
 
-  ConfiguredColumn col;
-  col.name = dataSpec.name;
-  col.dataType = dataSpec.getType();
-  col.column = vectorData;
-
-  m_configuredColumns.push_back(col);
-  m_configuredColumnIndices[col.name] = m_configuredColumns.size() - 1;
-
-  addColumnName(col.name);
+  m_configuredColumns.push_back(
+      {dataSpec.name, dataSpec.getType(), vectorData});
+  m_configuredColumnIndices[dataSpec.name] = m_configuredColumns.size() - 1;
+  addColumnName(dataSpec.name);
 
   return Status::Success;
 }
@@ -588,20 +596,20 @@ SizeType DynamicTable::addConfiguredColumn(
               << std::endl;
     return static_cast<SizeType>(-1);
   }
-  ConfiguredColumn config;
-  config.name = column->getName();
-  config.dataType = column->readData()->getDataType();
-  config.column = column;
+  const auto existing = m_configuredColumnIndices.find(column->getName());
+  if (existing != m_configuredColumnIndices.end()) {
+    return existing->second;
+  }
 
-  m_configuredColumns.push_back(config);
-  return m_configuredColumns.size() - 1;
+  const SizeType index = m_configuredColumns.size();
+  m_configuredColumns.push_back(
+      {column->getName(), column->readData()->getDataType(), column});
+  m_configuredColumnIndices[column->getName()] = index;
+  return index;
 }
 
 Status DynamicTable::ensureConfiguredColumnsLoaded()
 {
-  if (!m_configuredColumns.empty()) {
-    return Status::Success;
-  }
   return loadConfiguredColumnsFromFile();
 }
 
@@ -613,14 +621,13 @@ Status DynamicTable::loadConfiguredColumnsFromFile()
   }
 
   for (const auto& colName : m_colNames) {
-    auto col = readColumn<VectorData>(colName);
-    if (col) {
-      ConfiguredColumn confCol;
-      confCol.name = colName;
-      confCol.dataType = col->readData()->getDataType();
-      confCol.column = col;
-      m_configuredColumns.push_back(confCol);
-      m_configuredColumnIndices[colName] = m_configuredColumns.size() - 1;
+    if (m_configuredColumnIndices.find(colName)
+        != m_configuredColumnIndices.end())
+    {
+      continue;
+    }
+    if (auto col = readColumn<VectorData>(colName)) {
+      addConfiguredColumn(col);
     }
   }
   return Status::Success;
@@ -665,15 +672,14 @@ std::vector<int> DynamicTable::generateRowIDs(SizeType rowCount)
 {
   std::vector<int> ids(rowCount);
   int startId = 0;
-  if (m_rowElementIdentifiers) {
-    auto idData = m_rowElementIdentifiers->recordData();
-    auto currentShape = idData->getShape();
-    if (!currentShape.empty()) {
-      startId = static_cast<int>(currentShape[0]);
-    }
+  if (!m_rowElementIdentifiers) {
+    m_rowElementIdentifiers = readIdColumn();
   }
-  for (SizeType i = 0; i < rowCount; ++i) {
-    ids[i] = startId + static_cast<int>(i);
+  const auto idData =
+      m_rowElementIdentifiers ? m_rowElementIdentifiers->recordData() : nullptr;
+  if (idData && !idData->getShape().empty()) {
+    startId = static_cast<int>(idData->getShape()[0]);
   }
+  std::iota(ids.begin(), ids.end(), startId);
   return ids;
 }

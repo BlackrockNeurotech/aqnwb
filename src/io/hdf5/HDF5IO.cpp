@@ -988,44 +988,81 @@ Status HDF5IO::createReferenceDataSet(
     return Status::Failure;
   }
 
-  const hsize_t size = references.size();
+  try {
+    const hsize_t size = references.size();
+    std::vector<hobj_ref_t> referenceData(references.size());
+    for (SizeType i = 0; i < references.size(); ++i) {
+      m_file->reference(&referenceData[i], references[i].c_str());
+    }
 
-  hobj_ref_t* rdata = new hobj_ref_t[size * sizeof(hobj_ref_t)];
+    const hsize_t maxSize = H5S_UNLIMITED;
+    DataSpace dataSpace(1, &size, &maxSize);
+    DSetCreatPropList creationProperties;
+    const hsize_t chunkSize = std::max(size, static_cast<hsize_t>(1));
+    creationProperties.setChunk(1, &chunkSize);
 
-  for (SizeType i = 0; i < size; i++) {
-    m_file->reference(&rdata[i], references[i].c_str());
-  }
-
-  hid_t space = H5Screate_simple(1, &size, NULL);
-
-  hid_t dset = H5Dcreate(m_file->getLocId(),
-                         path.c_str(),
-                         H5T_STD_REF_OBJ,
-                         space,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT);
-
-  herr_t writeStatus = H5Dwrite(dset,
-                                H5T_STD_REF_OBJ,
-                                H5S_ALL,
-                                H5S_ALL,
-                                H5P_DEFAULT,
-                                static_cast<const void*>(rdata));
-
-  delete[] rdata;
-
-  herr_t dsetStatus = H5Dclose(dset);
-  if (intToStatus(dsetStatus) == Status::Failure) {
+    DataSet dataset = m_file->createDataSet(
+        path, PredType::STD_REF_OBJ, dataSpace, creationProperties);
+    if (!referenceData.empty()) {
+      dataset.write(referenceData.data(), PredType::STD_REF_OBJ);
+    }
+  } catch (const H5::Exception& error) {
+    error.printErrorStack();
     return Status::Failure;
   }
 
-  herr_t spaceStatus = H5Sclose(space);
-  if (intToStatus(spaceStatus) == Status::Failure) {
+  return Status::Success;
+}
+
+Status HDF5IO::appendReferenceDataSet(
+    const std::string& path, const std::vector<std::string>& references)
+{
+  if (!m_opened || !m_file) {
+    return Status::Failure;
+  }
+  if (references.empty()) {
+    return Status::Success;
+  }
+
+  try {
+    DataSet dataset = m_file->openDataSet(path);
+    if (H5Tequal(dataset.getDataType().getId(), H5T_STD_REF_OBJ) <= 0) {
+      return Status::Failure;
+    }
+
+    DataSpace fileSpace = dataset.getSpace();
+    if (fileSpace.getSimpleExtentNdims() != 1) {
+      return Status::Failure;
+    }
+
+    hsize_t currentSize = 0;
+    hsize_t maxSize = 0;
+    fileSpace.getSimpleExtentDims(&currentSize, &maxSize);
+    const hsize_t appendSize = references.size();
+    const hsize_t newSize = currentSize + appendSize;
+    if (newSize < currentSize
+        || (maxSize != H5S_UNLIMITED && newSize > maxSize))
+    {
+      return Status::Failure;
+    }
+
+    std::vector<hobj_ref_t> referenceData(references.size());
+    for (SizeType i = 0; i < references.size(); ++i) {
+      m_file->reference(&referenceData[i], references[i].c_str());
+    }
+
+    dataset.extend(&newSize);
+    fileSpace = dataset.getSpace();
+    fileSpace.selectHyperslab(H5S_SELECT_SET, &appendSize, &currentSize);
+    DataSpace memorySpace(1, &appendSize);
+    dataset.write(
+        referenceData.data(), PredType::STD_REF_OBJ, memorySpace, fileSpace);
+  } catch (const H5::Exception& error) {
+    error.printErrorStack();
     return Status::Failure;
   }
 
-  return intToStatus(writeStatus);
+  return Status::Success;
 }
 
 Status HDF5IO::createStringDataSet(const std::string& path,
@@ -1065,10 +1102,10 @@ Status HDF5IO::createStringDataSet(const std::string& path,
     return Status::Failure;
   }
 
-  dataset->writeDataBlock(
-      SizeArray {1}, SizeArray {0}, IO::BaseDataType::V_STR, values);
-
-  return Status::Success;
+  return dataset->writeDataBlock(SizeArray {values.size()},
+                                 SizeArray {0},
+                                 IO::BaseDataType::V_STR,
+                                 values);
 }
 
 Status HDF5IO::startRecording()

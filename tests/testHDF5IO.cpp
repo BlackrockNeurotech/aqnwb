@@ -2361,3 +2361,64 @@ TEST_CASE("getStorageObjectDataType", "[hdf5io]")
   // close file
   hdf5io.close();
 }
+
+TEST_CASE("HDF5IO; append to a reference dataset", "[hdf5io]")
+{
+  std::string path = getTestFilePath("appendReferenceDataSet.h5");
+  IO::HDF5::HDF5IO hdf5io(path);
+  hdf5io.open();
+  hdf5io.createGroup("/targets");
+  hdf5io.createGroup("/targets/a");
+  hdf5io.createGroup("/targets/b");
+  hdf5io.createGroup("/targets/c");
+
+  SECTION("append extends the dataset and preserves earlier entries")
+  {
+    const std::string refPath = "/refs";
+    REQUIRE(hdf5io.createReferenceDataSet(refPath, {"/targets/a"})
+            == Status::Success);
+    // createReferenceDataSet must use chunked storage, otherwise the dataset
+    // cannot be extended below.
+    REQUIRE_FALSE(hdf5io.getStorageObjectChunking(refPath).empty());
+
+    REQUIRE(hdf5io.appendReferenceDataSet(refPath, {"/targets/b", "/targets/c"})
+            == Status::Success);
+    REQUIRE(hdf5io.getStorageObjectShape(refPath) == SizeArray {3});
+
+    // An empty append is a no-op, not an error.
+    REQUIRE(hdf5io.appendReferenceDataSet(refPath, {}) == Status::Success);
+    REQUIRE(hdf5io.getStorageObjectShape(refPath) == SizeArray {3});
+  }
+
+  SECTION("append works while recording, when new objects cannot be created")
+  {
+    const std::string refPath = "/refsDuringRecording";
+    REQUIRE(hdf5io.createReferenceDataSet(refPath, {"/targets/a"})
+            == Status::Success);
+
+    REQUIRE(hdf5io.startRecording() == Status::Success);
+    // In SWMR mode new objects cannot be created, but extending an existing
+    // chunked dataset is still legal, so appending must not be gated on
+    // canModifyObjects().
+    REQUIRE_FALSE(hdf5io.canModifyObjects());
+    REQUIRE(hdf5io.appendReferenceDataSet(refPath, {"/targets/b"})
+            == Status::Success);
+    REQUIRE(hdf5io.getStorageObjectShape(refPath) == SizeArray {2});
+    hdf5io.stopRecording();
+  }
+
+  SECTION("append fails on a missing or non-reference dataset")
+  {
+    REQUIRE(hdf5io.appendReferenceDataSet("/doesNotExist", {"/targets/a"})
+            == Status::Failure);
+
+    const std::string intPath = "/intData";
+    IO::ArrayDataSetConfig config(
+        BaseDataType::I32, SizeArray {1}, SizeArray {1});
+    hdf5io.createArrayDataSet(config, intPath);
+    REQUIRE(hdf5io.appendReferenceDataSet(intPath, {"/targets/a"})
+            == Status::Failure);
+  }
+
+  hdf5io.close();
+}
